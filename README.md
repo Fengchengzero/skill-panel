@@ -1,6 +1,6 @@
 # Skill Panel
 
-轻量 Skill 管理面板（独立于 Skills Manager）。
+轻量 Skill 管理面板。
 
 ## 能力（v0.1）
 
@@ -78,7 +78,3 @@ chmod +x build-mac.sh
 
 生成：`.dmg` / `.app`，打开 DMG 拖到「应用程序」即可。  
 （无法在 Windows 上交叉编译出可用的 Mac 安装包。）
-
-## 与 Skills Manager 的关系
-
-全新独立项目与独立库目录，不共用 `~/.skills-manager`。
