@@ -1,6 +1,8 @@
 mod apply;
+mod backup;
 mod commands;
 mod deploy;
+mod grsai;
 mod install;
 mod library;
 
@@ -41,13 +43,18 @@ pub fn run() {
 
             #[cfg(desktop)]
             {
+                #[cfg(target_os = "macos")]
+                let toggle_mods = Modifiers::SUPER | Modifiers::SHIFT;
+                #[cfg(not(target_os = "macos"))]
+                let toggle_mods = Modifiers::CONTROL | Modifiers::SHIFT;
+
                 app.handle().plugin(
                     tauri_plugin_global_shortcut::Builder::new()
-                        .with_handler(|app, shortcut, event| {
+                        .with_handler(move |app, shortcut, event| {
                             if event.state != ShortcutState::Pressed {
                                 return;
                             }
-                            let expected = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyS);
+                            let expected = Shortcut::new(Some(toggle_mods), Code::KeyS);
                             if shortcut == &expected {
                                 toggle_main_window(app);
                             }
@@ -55,7 +62,7 @@ pub fn run() {
                         .build(),
                 )?;
 
-                let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyS);
+                let shortcut = Shortcut::new(Some(toggle_mods), Code::KeyS);
                 app.global_shortcut().register(shortcut)?;
             }
 
@@ -115,6 +122,8 @@ pub fn run() {
             commands::get_meta,
             commands::save_meta,
             commands::apply_skill,
+            commands::list_nested_skills,
+            commands::install_nested_skills,
             commands::install_local,
             commands::pick_and_install_local,
             commands::install_git,
@@ -126,6 +135,16 @@ pub fn run() {
             commands::update_skills,
             commands::backfill_skill_sources,
             commands::open_library_folder,
+            commands::get_ai_settings,
+            commands::save_ai_settings,
+            commands::reset_ai_prompts,
+            commands::test_ai_connection,
+            commands::cancel_ai,
+            commands::clear_ai_cancel,
+            commands::generate_skill_description,
+            commands::generate_skill_cover,
+            commands::export_library,
+            commands::import_library,
         ])
         .run(tauri::generate_context!())
         .expect("error while running skill-panel");

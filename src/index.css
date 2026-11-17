@@ -89,4 +89,48 @@ button:disabled {
   .sidebar-section-label {
     @apply mb-1.5 px-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-panel-muted/90;
   }
+
+  .skeleton-sheen {
+    animation: skeleton-sheen 1.4s ease-in-out infinite;
+    background-size: 200% 100%;
+  }
+
+  .ui-fade-in {
+    animation: ui-fade-in 220ms ease-out both;
+  }
+
+  .ui-fade-in-strong {
+    animation: ui-fade-in-strong 380ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+}
+
+@keyframes skeleton-sheen {
+  0% {
+    transform: translateX(-60%);
+  }
+  100% {
+    transform: translateX(60%);
+  }
+}
+
+@keyframes ui-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes ui-fade-in-strong {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
 }

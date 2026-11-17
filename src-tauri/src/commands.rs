@@ -1,6 +1,9 @@
 use crate::apply::{self, ApplyResult};
-use crate::install::{self, InstallResult, SkillUpdateInfo, UpdateApplyResult};
+use crate::backup::{self, BackupResult, RestoreMode, RestoreResult};
+use crate::grsai::{self, AiSettingsPublic, AiSettingsSave};
+use crate::install::{self, InstallResult, NestedSkillInfo, SkillUpdateInfo, UpdateApplyResult};
 use crate::library::{self, AppPaths, Folder, MetaStore, SkillCard};
+use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::DialogExt;
 
@@ -145,34 +148,71 @@ pub fn save_meta(meta: MetaStore) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn apply_skill(
+pub async fn apply_skill(
     app: AppHandle,
     skill_id: String,
     agent: String,
     copy_only: bool,
     auto_paste: bool,
+    expand_nested: Option<bool>,
 ) -> Result<ApplyResult, String> {
-    apply::apply_skill(&app, &skill_id, &agent, copy_only, auto_paste).map_err(|e| e.to_string())
+    let expand = expand_nested.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        apply::apply_skill(&app, &skill_id, &agent, copy_only, auto_paste, expand)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("应用任务中断：{e}"))?
 }
 
 #[tauri::command]
-pub fn install_local(path: String, name: Option<String>) -> Result<InstallResult, String> {
-    install::install_from_local(&path, name).map_err(|e| e.to_string())
+pub async fn list_nested_skills(skill_id: String) -> Result<Vec<NestedSkillInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        install::list_nested_skills(&skill_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("扫描中断：{e}"))?
+}
+
+#[tauri::command]
+pub async fn install_nested_skills(
+    skill_id: String,
+    rel_paths: Vec<String>,
+) -> Result<InstallResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        install::install_nested_skills(&skill_id, &rel_paths).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("安装任务中断：{e}"))?
+}
+
+#[tauri::command]
+pub async fn install_local(path: String, name: Option<String>) -> Result<InstallResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        install::install_from_local(&path, name).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("安装任务中断：{e}"))?
 }
 
 /// Native folder picker + install. More reliable than JS dialog under always-on-top.
 #[tauri::command]
-pub fn pick_and_install_local(app: AppHandle) -> Result<InstallResult, String> {
+pub async fn pick_and_install_local(app: AppHandle) -> Result<InstallResult, String> {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.set_always_on_top(false);
         let _ = win.set_focus();
     }
 
-    let picked = app
-        .dialog()
-        .file()
-        .set_title("选择技能目录（可选上级文件夹，自动批量扫描）")
-        .blocking_pick_folder();
+    let app_for_dialog = app.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app_for_dialog
+            .dialog()
+            .file()
+            .set_title("选择技能目录（可选上级文件夹，自动批量扫描）")
+            .blocking_pick_folder()
+    })
+    .await
+    .map_err(|e| format!("选择目录中断：{e}"))?;
 
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.show();
@@ -188,25 +228,39 @@ pub fn pick_and_install_local(app: AppHandle) -> Result<InstallResult, String> {
     let path = folder
         .into_path()
         .map_err(|e| format!("无法读取所选路径：{e}"))?;
-    install::install_from_local(&path.to_string_lossy(), None).map_err(|e| e.to_string())
+    let path_str = path.to_string_lossy().into_owned();
+    tauri::async_runtime::spawn_blocking(move || {
+        install::install_from_local(&path_str, None).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("安装任务中断：{e}"))?
 }
 
 #[tauri::command]
-pub fn install_git(
+pub async fn install_git(
     app: AppHandle,
     repo_url: String,
     subpath: Option<String>,
 ) -> Result<InstallResult, String> {
-    install::install_from_git(Some(&app), &repo_url, subpath).map_err(|e| e.to_string())
+    // Blocking network / git — keep off the async runtime (same pattern as AI commands).
+    tauri::async_runtime::spawn_blocking(move || {
+        install::install_from_git(Some(&app), &repo_url, subpath).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("安装任务中断：{e}"))?
 }
 
 #[tauri::command]
-pub fn install_skillssh(
+pub async fn install_skillssh(
     app: AppHandle,
     source: String,
     skill_id: String,
 ) -> Result<InstallResult, String> {
-    install::install_from_skillssh(Some(&app), &source, &skill_id).map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        install::install_from_skillssh(Some(&app), &source, &skill_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("安装任务中断：{e}"))?
 }
 
 #[tauri::command]
@@ -221,28 +275,134 @@ pub fn delete_skill(skill_id: String) -> Result<Vec<SkillCard>, String> {
 }
 
 #[tauri::command]
-pub fn check_skill_updates() -> Result<Vec<SkillUpdateInfo>, String> {
-    install::check_skill_updates().map_err(|e| e.to_string())
+pub async fn check_skill_updates() -> Result<Vec<SkillUpdateInfo>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        install::check_skill_updates().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("检查更新中断：{e}"))?
 }
 
 #[tauri::command]
-pub fn update_skill(skill_id: String) -> Result<Vec<SkillCard>, String> {
-    install::update_skill_from_source(&skill_id).map_err(|e| e.to_string())?;
-    library::list_skills().map_err(|e| e.to_string())
+pub async fn update_skill(skill_id: String) -> Result<Vec<SkillCard>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        install::update_skill_from_source(&skill_id).map_err(|e| e.to_string())?;
+        library::list_skills().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("更新中断：{e}"))?
 }
 
 #[tauri::command]
-pub fn update_skills(skill_ids: Vec<String>) -> Result<UpdateApplyResult, String> {
-    install::update_skills_from_source(&skill_ids).map_err(|e| e.to_string())
+pub async fn update_skills(skill_ids: Vec<String>) -> Result<UpdateApplyResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        install::update_skills_from_source(&skill_ids).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("更新中断：{e}"))?
 }
 
 #[tauri::command]
-pub fn backfill_skill_sources() -> Result<usize, String> {
-    install::backfill_sources_from_agent_dirs().map_err(|e| e.to_string())
+pub async fn backfill_skill_sources() -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        install::backfill_sources_from_agent_dirs().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("回填中断：{e}"))?
 }
 
 #[tauri::command]
 pub fn open_library_folder() -> Result<String, String> {
     let paths = library::ensure_library().map_err(|e| e.to_string())?;
     Ok(paths.skills)
+}
+
+#[tauri::command]
+pub fn get_ai_settings() -> Result<AiSettingsPublic, String> {
+    grsai::get_ai_settings_public().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn save_ai_settings(settings: AiSettingsSave) -> Result<AiSettingsPublic, String> {
+    grsai::update_ai_settings(settings).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn reset_ai_prompts() -> Result<AiSettingsPublic, String> {
+    grsai::reset_ai_prompts().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn test_ai_connection() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| grsai::test_ai_connection().map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| format!("测试中断：{e}"))?
+}
+
+#[tauri::command]
+pub fn cancel_ai() -> Result<(), String> {
+    grsai::request_cancel_ai();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn clear_ai_cancel() -> Result<(), String> {
+    grsai::clear_ai_cancel();
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GenerateDescriptionResult {
+    pub text: String,
+    pub skills: Vec<SkillCard>,
+}
+
+#[tauri::command]
+pub async fn generate_skill_description(
+    app: AppHandle,
+    skill_id: String,
+) -> Result<GenerateDescriptionResult, String> {
+    // ureq is blocking — keep it off the UI / async runtime thread
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        grsai::generate_skill_description(&skill_id, Some(&app)).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("生成任务中断：{e}"))?;
+    let (text, skills) = result?;
+    Ok(GenerateDescriptionResult { text, skills })
+}
+
+#[tauri::command]
+pub async fn generate_skill_cover(
+    app: AppHandle,
+    skill_id: String,
+) -> Result<Vec<SkillCard>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        grsai::generate_skill_cover(&skill_id, Some(&app)).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("生成任务中断：{e}"))?
+}
+
+#[tauri::command]
+pub async fn export_library(dest: String, as_folder: bool) -> Result<BackupResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        backup::export_library(&dest, as_folder).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("导出中断：{e}"))?
+}
+
+#[tauri::command]
+pub async fn import_library(source: String, mode: String) -> Result<RestoreResult, String> {
+    let restore_mode = match mode.as_str() {
+        "replace" => RestoreMode::Replace,
+        "merge_skip" | "merge" => RestoreMode::MergeSkip,
+        _ => return Err("未知恢复模式".into()),
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        backup::import_library(&source, restore_mode).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("导入中断：{e}"))?
 }

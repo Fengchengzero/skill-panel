@@ -1,8 +1,38 @@
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+use crate::install;
 use crate::library;
+
+fn should_skip_name(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | ".svn"
+            | ".hg"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "build"
+            | ".venv"
+            | "venv"
+            | "__pycache__"
+            | ".skill-panel"
+            | ".system"
+            | ".idea"
+            | ".vs"
+            | ".github"
+            | ".changeset"
+            | ".claude-plugin"
+            | ".agents"
+            | ".out-of-scope"
+            | ".DS_Store"
+            | "package-lock.json"
+            | "yarn.lock"
+            | "pnpm-lock.yaml"
+    )
+}
 
 fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst)?;
@@ -11,7 +41,7 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
         let ft = entry.file_type()?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if name_str == ".git" || name_str == ".DS_Store" {
+        if should_skip_name(&name_str) {
             continue;
         }
         if ft.is_symlink() {
@@ -31,7 +61,22 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn deploy_skill(skill_id: &str, agent: &str) -> Result<PathBuf> {
+fn deploy_path(src: &Path, dest: &Path) -> Result<()> {
+    if dest.exists() {
+        fs::remove_dir_all(dest)
+            .with_context(|| format!("Failed to replace existing deploy at {:?}", dest))?;
+    }
+    copy_dir(src, dest)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeployResult {
+    pub package_path: String,
+    pub expanded: Vec<String>,
+}
+
+pub fn deploy_skill(skill_id: &str, agent: &str, expand_nested: bool) -> Result<DeployResult> {
     let skills = library::skills_dir()?;
     let source = skills.join(skill_id);
     if !source.is_dir() {
@@ -39,11 +84,25 @@ pub fn deploy_skill(skill_id: &str, agent: &str) -> Result<PathBuf> {
     }
     let agent_dir = library::resolve_agent_dir(agent)?;
     fs::create_dir_all(&agent_dir)?;
+
     let dest = agent_dir.join(skill_id);
-    if dest.exists() {
-        fs::remove_dir_all(&dest)
-            .with_context(|| format!("Failed to replace existing deploy at {:?}", dest))?;
+    deploy_path(&source, &dest)?;
+
+    let mut expanded = Vec::new();
+    if expand_nested {
+        let nested = install::nested_skill_paths(skill_id).unwrap_or_default();
+        for (id, path) in nested {
+            if id == skill_id {
+                continue;
+            }
+            let nested_dest = agent_dir.join(&id);
+            deploy_path(&path, &nested_dest)?;
+            expanded.push(id);
+        }
     }
-    copy_dir(&source, &dest)?;
-    Ok(dest)
+
+    Ok(DeployResult {
+        package_path: dest.to_string_lossy().into_owned(),
+        expanded,
+    })
 }

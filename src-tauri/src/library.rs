@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillCard {
@@ -25,6 +26,9 @@ pub struct SkillCard {
     /// Local files edited after last sync from source
     #[serde(default)]
     pub local_modified: bool,
+    /// Unix seconds when first imported into the panel library.
+    #[serde(default)]
+    pub imported_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,8 +64,33 @@ pub struct MetaStore {
     /// skill_ids edited locally after last source sync
     #[serde(default)]
     pub locally_edited: BTreeSet<String>,
+    /// skill_id -> unix seconds of first import into panel
+    #[serde(default)]
+    pub imported_at: BTreeMap<String, u64>,
     pub cursor_skills_dir: Option<String>,
     pub codex_skills_dir: Option<String>,
+}
+
+pub fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Prefer FS created time; fall back to modified.
+pub fn dir_birth_secs(path: &Path) -> Option<u64> {
+    let meta = fs::metadata(path).ok()?;
+    let t = meta.created().or_else(|_| meta.modified()).ok()?;
+    t.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
+}
+
+/// Record first-import time if missing. Does not overwrite existing.
+pub fn touch_imported_at(meta: &mut MetaStore, skill_id: &str) {
+    if meta.imported_at.contains_key(skill_id) {
+        return;
+    }
+    meta.imported_at.insert(skill_id.to_string(), now_unix_secs());
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,8 +157,27 @@ pub fn save_meta(meta: &MetaStore) -> Result<()> {
 }
 
 struct SkillDocMeta {
+    name: String,
     description: String,
     description_zh: String,
+}
+
+fn empty_skill_doc() -> SkillDocMeta {
+    SkillDocMeta {
+        name: String::new(),
+        description: String::new(),
+        description_zh: String::new(),
+    }
+}
+
+pub(crate) fn read_skill_description(skill_dir: &Path) -> String {
+    read_skill_doc(skill_dir).description
+}
+
+/// Frontmatter `name:` for ChatGPT `$name` invoke; empty if missing.
+pub fn read_skill_frontmatter_name(skill_id: &str) -> Result<String> {
+    let dir = skills_dir()?.join(skill_id);
+    Ok(read_skill_doc(&dir).name)
 }
 
 fn read_skill_doc(skill_dir: &Path) -> SkillDocMeta {
@@ -140,16 +188,10 @@ fn read_skill_doc(skill_dir: &Path) -> SkillDocMeta {
     } else if alt.exists() {
         alt
     } else {
-        return SkillDocMeta {
-            description: String::new(),
-            description_zh: String::new(),
-        };
+        return empty_skill_doc();
     };
     let Ok(content) = fs::read_to_string(path) else {
-        return SkillDocMeta {
-            description: String::new(),
-            description_zh: String::new(),
-        };
+        return empty_skill_doc();
     };
     parse_skill_doc(&content)
 }
@@ -172,6 +214,7 @@ fn contains_cjk(s: &str) -> bool {
 
 fn parse_skill_doc(content: &str) -> SkillDocMeta {
     let mut in_frontmatter = false;
+    let mut name = String::new();
     let mut description = String::new();
     let mut description_zh = String::new();
 
@@ -191,6 +234,8 @@ fn parse_skill_doc(content: &str) -> SkillDocMeta {
             description_zh = strip_yaml_value(rest);
         } else if let Some(rest) = trimmed.strip_prefix("description:") {
             description = strip_yaml_value(rest);
+        } else if let Some(rest) = trimmed.strip_prefix("name:") {
+            name = strip_yaml_value(rest);
         }
     }
 
@@ -211,6 +256,7 @@ fn parse_skill_doc(content: &str) -> SkillDocMeta {
     }
 
     SkillDocMeta {
+        name,
         description,
         description_zh,
     }
@@ -246,7 +292,8 @@ fn is_native_skill(id: &str) -> bool {
 
 pub fn list_skills() -> Result<Vec<SkillCard>> {
     let skills = skills_dir()?;
-    let meta = load_meta()?;
+    let mut meta = load_meta()?;
+    let mut meta_dirty = false;
     let mut cards = Vec::new();
 
     if !skills.exists() {
@@ -284,6 +331,17 @@ pub fn list_skills() -> Result<Vec<SkillCard>> {
             .cloned()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(doc.description_zh);
+        let imported_at = meta
+            .imported_at
+            .get(&name)
+            .copied()
+            .or_else(|| dir_birth_secs(&path));
+        if let Some(ts) = imported_at {
+            if !meta.imported_at.contains_key(&name) {
+                meta.imported_at.insert(name.clone(), ts);
+                meta_dirty = true;
+            }
+        }
         cards.push(SkillCard {
             id: name.clone(),
             name: name.clone(),
@@ -298,7 +356,12 @@ pub fn list_skills() -> Result<Vec<SkillCard>> {
             cover_path,
             is_native: is_native_skill(&name),
             local_modified: meta.locally_edited.contains(&name),
+            imported_at,
         });
+    }
+
+    if meta_dirty {
+        let _ = save_meta(&meta);
     }
 
     cards.sort_by(|a, b| match (b.pinned, a.pinned) {
@@ -497,6 +560,36 @@ fn remove_cover_files_for(skill_id: &str, keep: Option<&Path>) {
     }
 }
 
+/// Card covers: downscale + JPEG so AI 4K sources stay lightweight on disk.
+const COVER_MAX_EDGE: u32 = 1600;
+const COVER_JPEG_QUALITY: u8 = 82;
+
+fn compress_cover_to_jpeg(source: &Path, dest: &Path) -> Result<()> {
+    let img = image::open(source).with_context(|| format!("读取封面失败: {}", source.display()))?;
+    let resized = if img.width().max(img.height()) > COVER_MAX_EDGE {
+        img.resize(COVER_MAX_EDGE, COVER_MAX_EDGE, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+    let rgb = resized.to_rgb8();
+    let mut out = Vec::new();
+    let mut encoder =
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, COVER_JPEG_QUALITY);
+    encoder
+        .encode(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .context("压缩封面失败")?;
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(dest, out).with_context(|| format!("写入封面失败: {}", dest.display()))?;
+    Ok(())
+}
+
 pub fn set_skill_cover(skill_id: &str, source_path: &str) -> Result<Vec<SkillCard>> {
     ensure_library()?;
     let source = PathBuf::from(source_path);
@@ -515,8 +608,19 @@ pub fn set_skill_cover(skill_id: &str, source_path: &str) -> Result<Vec<SkillCar
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let dest = covers_dir()?.join(format!("{skill_id}_{stamp}.{ext}"));
-    fs::copy(&source, &dest).with_context(|| format!("复制封面失败: {}", dest.display()))?;
+    let dest = covers_dir()?.join(format!("{skill_id}_{stamp}.jpg"));
+    if let Err(err) = compress_cover_to_jpeg(&source, &dest) {
+        // Fallback: keep original bytes if decode/compress fails
+        let fallback = covers_dir()?.join(format!("{skill_id}_{stamp}.{ext}"));
+        fs::copy(&source, &fallback)
+            .with_context(|| format!("复制封面失败（压缩也失败: {err}）: {}", fallback.display()))?;
+        remove_cover_files_for(skill_id, Some(&fallback));
+        let mut meta = load_meta()?;
+        meta.covers
+            .insert(skill_id.to_string(), fallback.to_string_lossy().into_owned());
+        save_meta(&meta)?;
+        return list_skills();
+    }
 
     remove_cover_files_for(skill_id, Some(&dest));
 
@@ -544,6 +648,7 @@ pub fn delete_skill(skill_id: &str) -> Result<Vec<SkillCard>> {
     meta.sources.remove(skill_id);
     meta.content_hashes.remove(skill_id);
     meta.locally_edited.remove(skill_id);
+    meta.imported_at.remove(skill_id);
     if let Some(cover) = meta.covers.remove(skill_id) {
         let _ = fs::remove_file(cover);
     }

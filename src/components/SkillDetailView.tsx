@@ -1,12 +1,31 @@
 import { useEffect, useMemo, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { ArrowLeft, Copy, ImagePlus, Pencil, Pin, Save, Sparkles, X } from "lucide-react";
-import { api, type Folder, type SkillCard } from "../lib/api";
+import {
+  ArrowLeft,
+  CheckSquare,
+  Copy,
+  ImagePlus,
+  Pencil,
+  Pin,
+  Save,
+  Sparkles,
+  Square,
+  Trash2,
+  X,
+} from "lucide-react";
+import {
+  api,
+  type AgentId,
+  type Folder,
+  type NestedSkillInfo,
+  type SkillCard,
+} from "../lib/api";
 import { cn } from "../lib/cn";
 
 interface Props {
   skill: SkillCard;
   folders: Folder[];
+  agent: AgentId;
   onBack: () => void;
   onSkillsChange: (skills: SkillCard[]) => void;
   onApply: () => Promise<void> | void;
@@ -14,12 +33,14 @@ interface Props {
   onTogglePin: () => Promise<void> | void;
   onSetCover: () => Promise<void> | void;
   onClearCover: () => Promise<void> | void;
+  onDelete: () => Promise<void> | void;
   onToast?: (msg: string) => void;
 }
 
 export function SkillDetailView({
   skill,
   folders,
+  agent,
   onBack,
   onSkillsChange,
   onApply,
@@ -27,6 +48,7 @@ export function SkillDetailView({
   onTogglePin,
   onSetCover,
   onClearCover,
+  onDelete,
   onToast,
 }: Props) {
   const [markdown, setMarkdown] = useState<string>("");
@@ -40,6 +62,10 @@ export function SkillDetailView({
   const [tags, setTags] = useState<string[]>(skill.tags || []);
   const [folderId, setFolderId] = useState(skill.folder_id || "");
   const [busy, setBusy] = useState(false);
+  const [nested, setNested] = useState<NestedSkillInfo[]>([]);
+  const [nestedLoading, setNestedLoading] = useState(false);
+  const [selectedNested, setSelectedNested] = useState<Set<string>>(new Set());
+  const [nestedBusy, setNestedBusy] = useState(false);
 
   useEffect(() => {
     setNameDraft(skill.display_name || skill.name);
@@ -72,7 +98,32 @@ export function SkillDetailView({
     };
   }, [skill.id]);
 
+  useEffect(() => {
+    let cancelled = false;
+    setNestedLoading(true);
+    setNested([]);
+    setSelectedNested(new Set());
+    api
+      .listNestedSkills(skill.id)
+      .then((list) => {
+        if (cancelled) return;
+        setNested(list);
+        setSelectedNested(new Set(list.filter((n) => !n.already_installed).map((n) => n.rel_path)));
+      })
+      .catch(() => {
+        if (!cancelled) setNested([]);
+      })
+      .finally(() => {
+        if (!cancelled) setNestedLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [skill.id]);
+
   const mdDirty = mdEditing && mdDraft !== markdown;
+  const selectedCount = selectedNested.size;
+  const allNestedSelected = nested.length > 0 && selectedCount === nested.length;
 
   const handleBack = () => {
     if (mdDirty && !window.confirm("正文有未保存修改，确定离开？")) return;
@@ -179,6 +230,75 @@ export function SkillDetailView({
     }
   };
 
+  const toggleNested = (relPath: string) => {
+    setSelectedNested((prev) => {
+      const next = new Set(prev);
+      if (next.has(relPath)) next.delete(relPath);
+      else next.add(relPath);
+      return next;
+    });
+  };
+
+  const toggleAllNested = () => {
+    if (allNestedSelected) {
+      setSelectedNested(new Set());
+    } else {
+      setSelectedNested(new Set(nested.map((n) => n.rel_path)));
+    }
+  };
+
+  const refreshNested = async () => {
+    const list = await api.listNestedSkills(skill.id);
+    setNested(list);
+    setSelectedNested(new Set(list.filter((n) => !n.already_installed).map((n) => n.rel_path)));
+  };
+
+  const installSelectedNested = async () => {
+    if (nestedBusy || selectedCount === 0) return;
+    setNestedBusy(true);
+    try {
+      const result = await api.installNestedSkills(skill.id, [...selectedNested]);
+      const list = await api.listSkills();
+      onSkillsChange(list);
+      await refreshNested();
+      const n = result.installed?.length ?? 0;
+      const s = result.skipped?.length ?? 0;
+      if (n > 0 && s === 0) onToast?.(`已安装 ${n} 个子技能到库`);
+      else if (n > 0) onToast?.(`新装 ${n} 个，跳过 ${s} 个已存在`);
+      else if (s > 0) onToast?.(`全部已存在，跳过 ${s} 个`);
+      else onToast?.("没有可安装的子技能");
+    } catch (e) {
+      onToast?.(String(e));
+    } finally {
+      setNestedBusy(false);
+    }
+  };
+
+  const expandDeploy = async () => {
+    if (nestedBusy || agent === "chatgpt") {
+      if (agent === "chatgpt") onToast?.("ChatGPT 仅支持复制调用名");
+      return;
+    }
+    setNestedBusy(true);
+    try {
+      const result = await api.applySkill(skill.id, agent, false, false, true);
+      onToast?.(result.message);
+    } catch (e) {
+      onToast?.(String(e));
+    } finally {
+      setNestedBusy(false);
+    }
+  };
+
+  const copyNestedInvoke = async (id: string) => {
+    try {
+      await navigator.clipboard.writeText(`$${id}`);
+      onToast?.(`已复制 $${id}`);
+    } catch {
+      onToast?.(`请手动复制 $${id}`);
+    }
+  };
+
   return (
     <div className="flex h-full min-h-0 flex-col">
       <header className="mb-4 flex shrink-0 flex-wrap items-center gap-3">
@@ -226,6 +346,15 @@ export function SkillDetailView({
           >
             <Copy size={13} aria-hidden="true" />
             复制调用名
+          </button>
+          <button
+            type="button"
+            onClick={() => void onDelete()}
+            className="glass-pill inline-flex items-center gap-1.5 px-3 py-2 text-[12px] font-semibold text-rose-600"
+            title="删除技能"
+          >
+            <Trash2 size={13} aria-hidden="true" />
+            删除
           </button>
         </div>
       </header>
@@ -373,6 +502,113 @@ export function SkillDetailView({
             <div className="font-semibold text-panel-ink/80">路径</div>
             <div className="mt-1 break-all font-en">{skill.path}</div>
           </div>
+
+          {(nestedLoading || nested.length > 0) && (
+            <div className="space-y-2 rounded-xl border border-panel-line/80 bg-panel-soft/40 p-3">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <div className="text-[12px] font-semibold text-panel-ink">
+                    子技能 {nestedLoading ? "…" : nested.length}
+                  </div>
+                  <p className="text-[10px] text-panel-muted">
+                    整包装入库后可勾选拆成独立技能，或展开部署到 Agent
+                  </p>
+                </div>
+                {nested.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={toggleAllNested}
+                    className="inline-flex items-center gap-1 rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-panel-ink shadow-inset"
+                  >
+                    {allNestedSelected ? (
+                      <CheckSquare size={11} aria-hidden="true" />
+                    ) : (
+                      <Square size={11} aria-hidden="true" />
+                    )}
+                    {allNestedSelected ? "取消全选" : "全选"}
+                  </button>
+                )}
+              </div>
+
+              {nested.length > 0 && (
+                <>
+                  <div className="max-h-48 space-y-1 overflow-auto pr-0.5">
+                    {nested.map((n) => {
+                      const checked = selectedNested.has(n.rel_path);
+                      return (
+                        <div
+                          key={n.rel_path}
+                          className="flex items-start gap-2 rounded-lg bg-white/80 px-2 py-1.5"
+                        >
+                          <button
+                            type="button"
+                            onClick={() => toggleNested(n.rel_path)}
+                            className="mt-0.5 shrink-0 text-panel-ink"
+                            aria-pressed={checked}
+                            aria-label={`选择 ${n.id}`}
+                          >
+                            {checked ? (
+                              <CheckSquare size={14} aria-hidden="true" />
+                            ) : (
+                              <Square size={14} aria-hidden="true" />
+                            )}
+                          </button>
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="truncate text-[12px] font-semibold">{n.name}</span>
+                              <span className="font-en text-[10px] text-panel-muted">${n.id}</span>
+                              {n.already_installed && (
+                                <span className="rounded-full bg-emerald-50 px-1.5 py-0.5 text-[9px] font-semibold text-emerald-700">
+                                  库中已有
+                                </span>
+                              )}
+                            </div>
+                            {n.description ? (
+                              <p className="mt-0.5 line-clamp-2 text-[10px] leading-4 text-panel-muted">
+                                {n.description}
+                              </p>
+                            ) : (
+                              <p className="mt-0.5 truncate font-en text-[10px] text-panel-muted">
+                                {n.rel_path}
+                              </p>
+                            )}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => void copyNestedInvoke(n.id)}
+                            className="shrink-0 rounded-full bg-panel-soft px-2 py-1 text-[10px] font-semibold text-panel-muted"
+                            title={`复制 $${n.id}`}
+                          >
+                            复制
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div className="flex flex-wrap gap-1.5 pt-1">
+                    <button
+                      type="button"
+                      disabled={nestedBusy || selectedCount === 0}
+                      onClick={() => void installSelectedNested()}
+                      className="rounded-full bg-panel-accent px-3 py-1.5 text-[11px] font-semibold text-white disabled:opacity-50"
+                    >
+                      {nestedBusy ? "处理中…" : `安装到库 (${selectedCount})`}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={nestedBusy || agent === "chatgpt"}
+                      onClick={() => void expandDeploy()}
+                      className="rounded-full bg-white px-3 py-1.5 text-[11px] font-semibold text-panel-ink shadow-inset disabled:opacity-50"
+                      title="把全部子技能平铺到 Cursor/Codex skills 目录"
+                    >
+                      展开部署到 Agent
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
         </section>
 
         <section className="flex min-h-0 flex-col overflow-hidden rounded-[22px] border border-white/80 bg-white/85 shadow-soft">

@@ -12,6 +12,19 @@ dist
 dist-ssr
 *.local
 
+# Build / installers (put binaries on GitHub Releases, not in git)
+release/
+*.exe
+*.dmg
+*.app
+src-tauri/target/
+
+# Local secrets / user library (lives in ~/.skill-panel, never commit)
+.env
+.env.*
+ai.json
+**/ai-last-error.log
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

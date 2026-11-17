@@ -17,6 +17,8 @@ export interface SkillCard {
   cover_path?: string | null;
   is_native?: boolean;
   local_modified?: boolean;
+  /** Unix seconds of first import into the panel library. */
+  imported_at?: number | null;
 }
 
 export interface Folder {
@@ -56,8 +58,17 @@ export interface UpdateApplyResult {
 export interface ApplyResult {
   invoke: string;
   deployed_to?: string | null;
+  expanded?: string[];
   pasted: boolean;
   message: string;
+}
+
+export interface NestedSkillInfo {
+  rel_path: string;
+  id: string;
+  name: string;
+  description: string;
+  already_installed: boolean;
 }
 
 export interface AppPaths {
@@ -83,6 +94,44 @@ export interface InstallProgress {
   stage: string;
   percent: number;
   message: string;
+}
+
+/** Image API wire format (text always uses OpenAI-compatible chat). */
+export type AiProvider = "grsai" | "openai";
+
+export interface AiSettingsPublic {
+  text_base_url: string;
+  text_model: string;
+  text_api_key_set: boolean;
+  text_api_key_hint: string;
+  image_provider: AiProvider;
+  image_base_url: string;
+  image_model: string;
+  image_api_key_set: boolean;
+  image_api_key_hint: string;
+  image_aspect: string;
+  image_resolution: string;
+  prompt_text: string;
+  prompt_image: string;
+}
+
+export interface AiSettingsSave {
+  text_api_key?: string | null;
+  text_base_url: string;
+  text_model: string;
+  image_api_key?: string | null;
+  image_provider: AiProvider;
+  image_base_url: string;
+  image_model: string;
+  image_aspect: string;
+  image_resolution: string;
+  prompt_text: string;
+  prompt_image: string;
+}
+
+export interface GenerateDescriptionResult {
+  text: string;
+  skills: SkillCard[];
 }
 
 export const api = {
@@ -116,8 +165,24 @@ export const api = {
   deleteSkill: (skillId: string) => invoke<SkillCard[]>("delete_skill", { skillId }),
   getMeta: () => invoke<MetaStore>("get_meta"),
   saveMeta: (meta: MetaStore) => invoke<void>("save_meta", { meta }),
-  applySkill: (skillId: string, agent: AgentId, copyOnly: boolean, autoPaste: boolean) =>
-    invoke<ApplyResult>("apply_skill", { skillId, agent, copyOnly, autoPaste }),
+  applySkill: (
+    skillId: string,
+    agent: AgentId,
+    copyOnly: boolean,
+    autoPaste: boolean,
+    expandNested = false
+  ) =>
+    invoke<ApplyResult>("apply_skill", {
+      skillId,
+      agent,
+      copyOnly,
+      autoPaste,
+      expandNested,
+    }),
+  listNestedSkills: (skillId: string) =>
+    invoke<NestedSkillInfo[]>("list_nested_skills", { skillId }),
+  installNestedSkills: (skillId: string, relPaths: string[]) =>
+    invoke<InstallResult>("install_nested_skills", { skillId, relPaths }),
   installLocal: (path: string, name?: string) =>
     invoke<InstallResult>("install_local", { path, name: name ?? null }),
   pickAndInstallLocal: () => invoke<InstallResult>("pick_and_install_local"),
@@ -132,4 +197,27 @@ export const api = {
     invoke<UpdateApplyResult>("update_skills", { skillIds }),
   backfillSkillSources: () => invoke<number>("backfill_skill_sources"),
   openLibraryFolder: () => invoke<string>("open_library_folder"),
+  getAiSettings: () => invoke<AiSettingsPublic>("get_ai_settings"),
+  saveAiSettings: (settings: AiSettingsSave) =>
+    invoke<AiSettingsPublic>("save_ai_settings", { settings }),
+  resetAiPrompts: () => invoke<AiSettingsPublic>("reset_ai_prompts"),
+  testAiConnection: () => invoke<string>("test_ai_connection"),
+  cancelAi: () => invoke<void>("cancel_ai"),
+  clearAiCancel: () => invoke<void>("clear_ai_cancel"),
+  generateSkillDescription: (skillId: string) =>
+    invoke<GenerateDescriptionResult>("generate_skill_description", { skillId }),
+  generateSkillCover: (skillId: string) =>
+    invoke<SkillCard[]>("generate_skill_cover", { skillId }),
+  exportLibrary: (dest: string, asFolder: boolean) =>
+    invoke<{ path: string; message: string }>("export_library", { dest, asFolder }),
+  importLibrary: (source: string, mode: "replace" | "merge_skip") =>
+    invoke<{ message: string; skills: SkillCard[] }>("import_library", { source, mode }),
 };
+
+export interface AiProgress {
+  kind: string;
+  skill_id: string;
+  stage: string;
+  percent: number;
+  message: string;
+}
