@@ -2,7 +2,7 @@ use crate::apply::{self, ApplyResult};
 use crate::backup::{self, BackupResult, RestoreMode, RestoreResult};
 use crate::grsai::{self, AiSettingsPublic, AiSettingsSave};
 use crate::install::{self, InstallResult, NestedSkillInfo, SkillUpdateInfo, UpdateApplyResult};
-use crate::library::{self, AppPaths, Folder, MetaStore, SkillCard};
+use crate::library::{self, AppPaths, CoverCompressResult, Folder, MetaStore, SkillCard};
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::DialogExt;
@@ -382,6 +382,15 @@ pub async fn generate_skill_cover(
     })
     .await
     .map_err(|e| format!("生成任务中断：{e}"))?
+}
+
+#[tauri::command]
+pub async fn recompress_covers() -> Result<(CoverCompressResult, Vec<SkillCard>), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        library::recompress_all_covers().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("压缩中断：{e}"))?
 }
 
 #[tauri::command]

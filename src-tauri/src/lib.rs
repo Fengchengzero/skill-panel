@@ -63,33 +63,40 @@ pub fn run() {
                 )?;
 
                 let shortcut = Shortcut::new(Some(toggle_mods), Code::KeyS);
-                app.global_shortcut().register(shortcut)?;
+                if let Err(err) = app.global_shortcut().register(shortcut) {
+                    // Another instance / app may already own Ctrl/Cmd+Shift+S — still boot.
+                    eprintln!("全局快捷键注册失败（可忽略，仍可用托盘打开）: {err}");
+                }
             }
 
             let show_i = MenuItem::with_id(app, "show", "Show Panel", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
 
-            let _tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
-                .menu(&menu)
-                .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => show_main_window(app),
-                    "quit" => app.exit(0),
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        toggle_main_window(tray.app_handle());
-                    }
-                })
-                .build(app)?;
+            if let Some(icon) = app.default_window_icon().cloned() {
+                let _tray = TrayIconBuilder::new()
+                    .icon(icon)
+                    .menu(&menu)
+                    .show_menu_on_left_click(false)
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "show" => show_main_window(app),
+                        "quit" => app.exit(0),
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            toggle_main_window(tray.app_handle());
+                        }
+                    })
+                    .build(app)?;
+            } else {
+                eprintln!("tray icon skipped: default window icon missing");
+            }
 
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_always_on_top(true);
@@ -143,6 +150,7 @@ pub fn run() {
             commands::clear_ai_cancel,
             commands::generate_skill_description,
             commands::generate_skill_cover,
+            commands::recompress_covers,
             commands::export_library,
             commands::import_library,
         ])

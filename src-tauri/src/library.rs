@@ -46,7 +46,7 @@ pub struct MetaStore {
     /// skill_id -> folder_id
     #[serde(default)]
     pub skill_folder: BTreeMap<String, String>,
-    /// skill_id -> absolute cover path
+    /// skill_id -> cover path. Locally prefer absolute paths; backups may store filenames only.
     #[serde(default)]
     pub covers: BTreeMap<String, String>,
     /// skill_id -> Chinese description
@@ -143,7 +143,16 @@ pub fn load_meta() -> Result<MetaStore> {
     ensure_library()?;
     let path = meta_path()?;
     let raw = fs::read_to_string(&path).unwrap_or_else(|_| "{}".into());
-    Ok(serde_json::from_str(&raw).unwrap_or_default())
+    match serde_json::from_str::<MetaStore>(&raw) {
+        Ok(meta) => Ok(meta),
+        Err(err) => {
+            // Never silently clobber a corrupt meta with {} on next save.
+            let bak = path.with_extension("json.parse-error.bak");
+            let _ = fs::write(&bak, &raw);
+            eprintln!("meta.json 解析失败，已备份到 {}: {err}", bak.display());
+            Ok(MetaStore::default())
+        }
+    }
 }
 
 pub fn save_meta(meta: &MetaStore) -> Result<()> {
@@ -151,8 +160,186 @@ pub fn save_meta(meta: &MetaStore) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    // Atomic-ish write: temp then rename, avoid truncated meta on crash.
+    let tmp = path.with_extension("json.tmp");
     let raw = serde_json::to_string_pretty(meta)?;
-    fs::write(path, raw)?;
+    fs::write(&tmp, raw)?;
+    fs::rename(&tmp, &path).or_else(|_| {
+        fs::copy(&tmp, &path)?;
+        fs::remove_file(&tmp)
+    })?;
+    Ok(())
+}
+
+/// If `covers` meta is empty/broken but image files exist, rebuild absolute mappings.
+pub fn repair_covers_from_disk(meta: &mut MetaStore) -> Result<bool> {
+    ensure_library()?;
+    let dir = covers_dir()?;
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Ok(false);
+    };
+    let mut dirty = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let skill_id = name
+            .rsplit_once('_')
+            .and_then(|(id, rest)| {
+                let stem = rest.rsplit_once('.').map(|(s, _)| s).unwrap_or(rest);
+                if !stem.is_empty() && stem.chars().all(|c| c.is_ascii_digit()) {
+                    Some(id.to_string())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                Path::new(&name)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+            })
+            .unwrap_or(name);
+        let abs = path.to_string_lossy().into_owned();
+        match meta.covers.get(&skill_id) {
+            Some(existing) if resolve_cover_abs(existing).is_some() => {}
+            _ => {
+                meta.covers.insert(skill_id, abs);
+                dirty = true;
+            }
+        }
+    }
+    Ok(dirty)
+}
+
+/// True when `stored` looks like a path (absolute or with directories), not a bare filename.
+fn cover_entry_is_path(stored: &str) -> bool {
+    stored.contains('/') || stored.contains('\\') || Path::new(stored).is_absolute()
+}
+
+fn cover_basename(stored: &str) -> Option<String> {
+    Path::new(stored)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+}
+
+/// Resolve a meta cover entry to an absolute file path that exists.
+/// Accepts portable filenames (`skill_123.jpg`) and legacy absolute paths.
+pub fn resolve_cover_abs(stored: &str) -> Option<PathBuf> {
+    let direct = PathBuf::from(stored);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let name = cover_basename(stored)?;
+    let candidate = covers_dir().ok()?.join(name);
+    if candidate.is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+/// Prefer the newest `skill_id_*` / `skill_id.*` file under covers/.
+fn find_cover_file_for_skill(skill_id: &str) -> Option<PathBuf> {
+    let dir = covers_dir().ok()?;
+    let prefix_dot = format!("{skill_id}.");
+    let prefix_us = format!("{skill_id}_");
+    let mut best: Option<(u64, PathBuf)> = None;
+    let entries = fs::read_dir(&dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !(name.starts_with(&prefix_dot) || name.starts_with(&prefix_us)) {
+            continue;
+        }
+        let stamp = fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if best.as_ref().map(|(s, _)| stamp >= *s).unwrap_or(true) {
+            best = Some((stamp, path));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+fn cover_storage_value(abs: &Path) -> String {
+    abs.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| abs.to_string_lossy().into_owned())
+}
+
+/// Bind `meta.covers` to absolute paths under this machine's `covers/` directory.
+/// Used after backup import. Returns true if meta changed.
+pub fn remap_covers_to_local(meta: &mut MetaStore) -> Result<bool> {
+    ensure_library()?;
+    let mut dirty = false;
+    let mut next = BTreeMap::new();
+    for (skill_id, stored) in meta.covers.iter() {
+        let abs = resolve_cover_abs(stored).or_else(|| find_cover_file_for_skill(skill_id));
+        match abs {
+            Some(path) => {
+                let value = path.to_string_lossy().into_owned();
+                if value != *stored {
+                    dirty = true;
+                }
+                next.insert(skill_id.clone(), value);
+            }
+            None => {
+                // Drop broken absolute paths from another machine.
+                dirty = true;
+            }
+        }
+    }
+    // Also discover cover files for skills that have no meta entry yet.
+    if let Ok(skills) = skills_dir() {
+        if let Ok(entries) = fs::read_dir(skills) {
+            for entry in entries.flatten() {
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let skill_id = entry.file_name().to_string_lossy().into_owned();
+                if skill_id.starts_with('.') || next.contains_key(&skill_id) {
+                    continue;
+                }
+                if let Some(path) = find_cover_file_for_skill(&skill_id) {
+                    next.insert(skill_id, path.to_string_lossy().into_owned());
+                    dirty = true;
+                }
+            }
+        }
+    }
+    if dirty || next.len() != meta.covers.len() {
+        meta.covers = next;
+        dirty = true;
+    }
+    Ok(dirty)
+}
+
+/// Normalize cover entries to filenames before writing a backup meta.json.
+pub fn normalize_covers_for_export(meta: &mut MetaStore) -> Result<()> {
+    let _ = remap_covers_to_local(meta)?;
+    // Force filename-only even when remap reported no change but values were absolute
+    // and files still exist on this machine (same path → dirty false above).
+    let mut next = BTreeMap::new();
+    for (skill_id, stored) in meta.covers.iter() {
+        if let Some(abs) = resolve_cover_abs(stored).or_else(|| find_cover_file_for_skill(skill_id)) {
+            next.insert(skill_id.clone(), cover_storage_value(&abs));
+        } else if !cover_entry_is_path(stored) {
+            next.insert(skill_id.clone(), stored.clone());
+        }
+    }
+    meta.covers = next;
     Ok(())
 }
 
@@ -294,6 +481,9 @@ pub fn list_skills() -> Result<Vec<SkillCard>> {
     let skills = skills_dir()?;
     let mut meta = load_meta()?;
     let mut meta_dirty = false;
+    if repair_covers_from_disk(&mut meta)? {
+        meta_dirty = true;
+    }
     let mut cards = Vec::new();
 
     if !skills.exists() {
@@ -316,7 +506,26 @@ pub fn list_skills() -> Result<Vec<SkillCard>> {
         }
         let tags = meta.tags.get(&name).cloned().unwrap_or_default();
         let folder_id = meta.skill_folder.get(&name).cloned();
-        let cover_path = meta.covers.get(&name).cloned().filter(|p| Path::new(p).exists());
+        let cover_path = {
+            let stored = meta.covers.get(&name).cloned();
+            // Resolve filename-or-absolute; also recover from covers/ when meta is missing.
+            match stored
+                .as_deref()
+                .and_then(resolve_cover_abs)
+                .or_else(|| find_cover_file_for_skill(&name))
+            {
+                Some(abs) => {
+                    let abs_str = abs.to_string_lossy().into_owned();
+                    // Keep local meta on absolute paths so asset protocol / older builds keep working.
+                    if stored.as_deref() != Some(abs_str.as_str()) {
+                        meta.covers.insert(name.clone(), abs_str.clone());
+                        meta_dirty = true;
+                    }
+                    Some(abs_str)
+                }
+                None => None,
+            }
+        };
         let display_name = meta
             .display_names
             .get(&name)
@@ -560,21 +769,17 @@ fn remove_cover_files_for(skill_id: &str, keep: Option<&Path>) {
     }
 }
 
-/// Card covers: downscale + JPEG so AI 4K sources stay lightweight on disk.
-const COVER_MAX_EDGE: u32 = 1600;
-const COVER_JPEG_QUALITY: u8 = 82;
+/// Card covers: downscale + JPEG so AI/4K sources stay lightweight on disk & in backups.
+const COVER_MAX_EDGE: u32 = 960;
+const COVER_MIN_EDGE: u32 = 640;
+const COVER_JPEG_QUALITY_START: u8 = 78;
+const COVER_JPEG_QUALITY_MIN: u8 = 55;
+/// Soft budget; encoder will lower quality / edge until under this (or floors hit).
+const COVER_TARGET_BYTES: usize = 160 * 1024;
 
-fn compress_cover_to_jpeg(source: &Path, dest: &Path) -> Result<()> {
-    let img = image::open(source).with_context(|| format!("读取封面失败: {}", source.display()))?;
-    let resized = if img.width().max(img.height()) > COVER_MAX_EDGE {
-        img.resize(COVER_MAX_EDGE, COVER_MAX_EDGE, image::imageops::FilterType::Triangle)
-    } else {
-        img
-    };
-    let rgb = resized.to_rgb8();
+fn encode_cover_jpeg(rgb: &image::RgbImage, quality: u8) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    let mut encoder =
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, COVER_JPEG_QUALITY);
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
     encoder
         .encode(
             rgb.as_raw(),
@@ -583,11 +788,223 @@ fn compress_cover_to_jpeg(source: &Path, dest: &Path) -> Result<()> {
             image::ExtendedColorType::Rgb8,
         )
         .context("压缩封面失败")?;
+    Ok(out)
+}
+
+fn compress_cover_to_jpeg(source: &Path, dest: &Path) -> Result<()> {
+    let img = image::open(source).with_context(|| format!("读取封面失败: {}", source.display()))?;
+    let mut edge = COVER_MAX_EDGE.min(img.width().max(img.height()).max(1));
+    let mut quality = COVER_JPEG_QUALITY_START;
+    let mut best = encode_cover_jpeg(
+        &{
+            let resized = if img.width().max(img.height()) > edge {
+                img.resize(edge, edge, image::imageops::FilterType::Triangle)
+            } else {
+                img.clone()
+            };
+            resized.to_rgb8()
+        },
+        quality,
+    )?;
+
+    // Progressively tighten until under budget or floors are hit.
+    while best.len() > COVER_TARGET_BYTES {
+        if quality > COVER_JPEG_QUALITY_MIN {
+            quality = quality.saturating_sub(8).max(COVER_JPEG_QUALITY_MIN);
+        } else if edge > COVER_MIN_EDGE {
+            edge = ((edge * 3) / 4).max(COVER_MIN_EDGE);
+            quality = COVER_JPEG_QUALITY_START;
+        } else {
+            break;
+        }
+        let resized = if img.width().max(img.height()) > edge {
+            img.resize(edge, edge, image::imageops::FilterType::Triangle)
+        } else {
+            img.clone()
+        };
+        let candidate = encode_cover_jpeg(&resized.to_rgb8(), quality)?;
+        if candidate.len() < best.len() {
+            best = candidate;
+        } else if quality <= COVER_JPEG_QUALITY_MIN && edge <= COVER_MIN_EDGE {
+            break;
+        }
+    }
+
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(dest, out).with_context(|| format!("写入封面失败: {}", dest.display()))?;
+    fs::write(dest, best).with_context(|| format!("写入封面失败: {}", dest.display()))?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoverCompressResult {
+    pub scanned: u32,
+    pub compressed: u32,
+    pub skipped: u32,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub message: String,
+}
+
+fn format_bytes(n: u64) -> String {
+    if n >= 1024 * 1024 {
+        format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+    } else if n >= 1024 {
+        format!("{:.0} KB", n as f64 / 1024.0)
+    } else {
+        format!("{n} B")
+    }
+}
+
+/// Re-encode every cover under `covers/` to the current JPEG budget and refresh meta paths.
+pub fn recompress_all_covers() -> Result<(CoverCompressResult, Vec<SkillCard>)> {
+    ensure_library()?;
+    let dir = covers_dir()?;
+    let mut scanned = 0u32;
+    let mut compressed = 0u32;
+    let mut skipped = 0u32;
+    let mut bytes_before = 0u64;
+    let mut bytes_after = 0u64;
+    let mut renamed: BTreeMap<String, String> = BTreeMap::new();
+
+    let entries: Vec<_> = fs::read_dir(&dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+
+    for path in entries {
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp") {
+            continue;
+        }
+
+        scanned += 1;
+        let before = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        bytes_before += before;
+
+        // Already small enough JPEG — keep as-is.
+        if matches!(ext.as_str(), "jpg" | "jpeg") && before > 0 && before as usize <= COVER_TARGET_BYTES {
+            bytes_after += before;
+            skipped += 1;
+            continue;
+        }
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "cover".into());
+        // Preserve skill_id prefix (`id_stamp` or `id`) for later lookup.
+        let skill_prefix = stem
+            .split_once('_')
+            .map(|(id, _)| id.to_string())
+            .unwrap_or_else(|| stem.clone());
+        let tmp = dir.join(format!(".{skill_prefix}_recompress-{stamp}.jpg"));
+        let final_path = dir.join(format!("{skill_prefix}_{stamp}.jpg"));
+
+        match compress_cover_to_jpeg(&path, &tmp) {
+            Ok(()) => {
+                let after = fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+                // Only keep if we actually shrink (or convert non-jpeg).
+                if after > 0 && (after < before || !matches!(ext.as_str(), "jpg" | "jpeg")) {
+                    if let Err(err) = fs::rename(&tmp, &final_path) {
+                        let _ = fs::remove_file(&tmp);
+                        bytes_after += before;
+                        skipped += 1;
+                        eprintln!("封面压缩替换失败 {}: {err}", path.display());
+                        continue;
+                    }
+                    let _ = fs::remove_file(&path);
+                    bytes_after += after;
+                    compressed += 1;
+                    renamed.insert(name, final_path.to_string_lossy().into_owned());
+                } else {
+                    let _ = fs::remove_file(&tmp);
+                    bytes_after += before;
+                    skipped += 1;
+                }
+            }
+            Err(err) => {
+                let _ = fs::remove_file(&tmp);
+                bytes_after += before;
+                skipped += 1;
+                eprintln!("封面压缩跳过 {}: {err:#}", path.display());
+            }
+        }
+    }
+
+    // Point meta.covers at recompressed absolute paths when we renamed files.
+    if !renamed.is_empty() {
+        let mut meta = load_meta()?;
+        let mut dirty = false;
+        for (skill_id, stored) in meta.covers.clone() {
+            let key = cover_basename(&stored).unwrap_or(stored.clone());
+            if let Some(new_abs) = renamed.get(&key) {
+                meta.covers.insert(skill_id, new_abs.clone());
+                dirty = true;
+            }
+        }
+        // Also bind any skill whose cover file was recompressed by prefix scan.
+        for (old_name, new_abs) in &renamed {
+            let skill_id = old_name
+                .split_once('_')
+                .map(|(id, _)| id)
+                .or_else(|| old_name.split_once('.').map(|(id, _)| id))
+                .unwrap_or(old_name.as_str());
+            if !meta.covers.contains_key(skill_id) {
+                continue;
+            }
+            let cur = meta.covers.get(skill_id).cloned().unwrap_or_default();
+            let cur_base = cover_basename(&cur).unwrap_or(cur);
+            if cur_base == *old_name || resolve_cover_abs(&cur_base).is_none() {
+                meta.covers.insert(skill_id.to_string(), new_abs.clone());
+                dirty = true;
+            }
+        }
+        if dirty {
+            save_meta(&meta)?;
+        }
+    }
+
+    let saved = bytes_before.saturating_sub(bytes_after);
+    let message = if compressed == 0 {
+        format!(
+            "扫描 {scanned} 张封面，无需再压（已跳过 {skipped}）"
+        )
+    } else {
+        format!(
+            "已压缩 {compressed}/{scanned} 张封面，约节省 {}（前 {} → 后 {}）",
+            format_bytes(saved),
+            format_bytes(bytes_before),
+            format_bytes(bytes_after)
+        )
+    };
+
+    Ok((
+        CoverCompressResult {
+            scanned,
+            compressed,
+            skipped,
+            bytes_before,
+            bytes_after,
+            message,
+        },
+        list_skills()?,
+    ))
 }
 
 pub fn set_skill_cover(skill_id: &str, source_path: &str) -> Result<Vec<SkillCard>> {
@@ -649,25 +1066,22 @@ pub fn delete_skill(skill_id: &str) -> Result<Vec<SkillCard>> {
     meta.content_hashes.remove(skill_id);
     meta.locally_edited.remove(skill_id);
     meta.imported_at.remove(skill_id);
-    if let Some(cover) = meta.covers.remove(skill_id) {
-        let _ = fs::remove_file(cover);
-    }
-    if let Ok(entries) = fs::read_dir(covers_dir()?) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(&format!("{skill_id}.")) {
-                let _ = fs::remove_file(entry.path());
-            }
+    if let Some(stored) = meta.covers.remove(skill_id) {
+        if let Some(abs) = resolve_cover_abs(&stored) {
+            let _ = fs::remove_file(abs);
         }
     }
+    remove_cover_files_for(skill_id, None);
     save_meta(&meta)?;
     list_skills()
 }
 
 pub fn clear_skill_cover(skill_id: &str) -> Result<Vec<SkillCard>> {
     let mut meta = load_meta()?;
-    if let Some(path) = meta.covers.remove(skill_id) {
-        let _ = fs::remove_file(path);
+    if let Some(stored) = meta.covers.remove(skill_id) {
+        if let Some(abs) = resolve_cover_abs(&stored) {
+            let _ = fs::remove_file(abs);
+        }
     }
     remove_cover_files_for(skill_id, None);
     save_meta(&meta)?;

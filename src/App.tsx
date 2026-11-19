@@ -1277,6 +1277,20 @@ export default function App() {
     }
   };
 
+  const recompressCovers = async () => {
+    if (backupBusy) return;
+    setBackupBusy(true);
+    try {
+      const [result, list] = await api.recompressCovers();
+      setSkills(list);
+      showToast(result.message, 8000);
+    } catch (e) {
+      showToast(formatErr(e), 12000);
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
   const exportBackup = async (asFolder: boolean) => {
     if (backupBusy) return;
     setBackupBusy(true);
@@ -2745,7 +2759,7 @@ export default function App() {
                         )}
                       </div>
                       <p className="text-[11px] leading-5 text-panel-muted">
-                        封面提示词由文字通道生成，再交出图通道；入库压缩为长边 ≤1600 JPEG。
+                        封面提示词由文字通道生成，再交出图通道；入库自动压缩（约 ≤160KB JPEG）。
                       </p>
                     </div>
                   )}
@@ -2841,7 +2855,7 @@ export default function App() {
                     备份与恢复
                   </h2>
                   <p className="mt-1 text-[12px] text-panel-muted">
-                    导出 skills / meta / covers / ai 配置（不含 API Key）；恢复时可选替换或合并跳过。
+                    导出 skills / meta / 生成封面 / ai 配置（不含 API Key）；换机恢复后封面会一并还原。恢复可选替换或合并跳过。新生成封面会自动压到约 160KB 内；已有大图可点下方压缩。
                   </p>
                 </div>
                 <div className="flex flex-wrap gap-2">
@@ -2868,6 +2882,14 @@ export default function App() {
                     className="rounded-full bg-panel-soft px-4 py-2.5 text-[13px] font-semibold text-panel-ink disabled:opacity-50"
                   >
                     从备份恢复…
+                  </button>
+                  <button
+                    type="button"
+                    disabled={backupBusy}
+                    onClick={() => void recompressCovers()}
+                    className="rounded-full bg-panel-soft px-4 py-2.5 text-[13px] font-semibold text-panel-ink disabled:opacity-50"
+                  >
+                    压缩已有封面
                   </button>
                 </div>
               </section>

@@ -62,13 +62,20 @@ fn write_backup_contents(out: &Path, stamp: u64) -> Result<()> {
     fs::create_dir_all(out)?;
     copy_dir_recursive(&library::skills_dir()?, &out.join("skills"))?;
     copy_dir_recursive(&library::covers_dir()?, &out.join("covers"))?;
-    fs::copy(library::meta_path()?, out.join("meta.json"))?;
+    // Portable meta: cover entries are filenames under covers/, not machine-local absolute paths.
+    let mut meta = library::load_meta()?;
+    library::normalize_covers_for_export(&mut meta)?;
+    fs::write(
+        out.join("meta.json"),
+        serde_json::to_string_pretty(&meta)?,
+    )?;
     write_ai_settings_redacted(&out.join("ai.json"))?;
     let manifest = serde_json::json!({
         "format": "skill-panel-backup",
         "version": 1,
         "exported_at": stamp,
-        "includes_api_key": false
+        "includes_api_key": false,
+        "includes_covers": true
     });
     fs::write(out.join("backup.json"), serde_json::to_string_pretty(&manifest)?)?;
     Ok(())
@@ -211,6 +218,17 @@ fn merge_meta(current: &mut MetaStore, incoming: MetaStore) {
     for id in incoming.locally_edited {
         current.locally_edited.insert(id);
     }
+    for (k, v) in incoming.imported_at {
+        current.imported_at.entry(k).or_insert(v);
+    }
+}
+
+fn finalize_imported_covers() -> Result<()> {
+    let mut meta = library::load_meta()?;
+    if library::remap_covers_to_local(&mut meta)? {
+        library::save_meta(&meta)?;
+    }
+    Ok(())
 }
 
 fn restore_ai_settings_keep_keys(src: &Path) -> Result<()> {
@@ -299,9 +317,11 @@ fn import_from_dir(src: &Path, mode: RestoreMode) -> Result<RestoreResult> {
             let _ = restore_ai_settings_keep_keys(src);
             let _ = fs::remove_dir_all(&skills_old);
             let _ = fs::remove_dir_all(&covers_old);
+            // Bind cover filenames / legacy absolute paths to this machine's covers/.
+            finalize_imported_covers()?;
 
             Ok(RestoreResult {
-                message: "已整库替换恢复".into(),
+                message: "已整库替换恢复（含封面）".into(),
                 skills: library::list_skills()?,
             })
         }
@@ -336,8 +356,9 @@ fn import_from_dir(src: &Path, mode: RestoreMode) -> Result<RestoreResult> {
             let mut current = library::load_meta()?;
             merge_meta(&mut current, incoming);
             library::save_meta(&current)?;
+            finalize_imported_covers()?;
             Ok(RestoreResult {
-                message: "已合并恢复（同名技能已跳过）".into(),
+                message: "已合并恢复（同名技能已跳过，含封面）".into(),
                 skills: library::list_skills()?,
             })
         }

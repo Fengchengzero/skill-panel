@@ -6,32 +6,57 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
+**/ai-last-error.log
 
+# Dependencies
 node_modules
+
+# Frontend build
 dist
 dist-ssr
 *.local
 
-# Build / installers (put binaries on GitHub Releases, not in git)
+# Tauri / Rust build
+src-tauri/target
+src-tauri/gen/schemas
+**/target/
+
+# Packaged installers / portable binaries (rebuild with build-win.bat / build-mac.sh)
 release/
 *.exe
 *.dmg
 *.app
-src-tauri/target/
+*.msi
+*.nsis.zip
+*.AppImage
+*.deb
+*.rpm
+!src-tauri/icons/**
 
-# Local secrets / user library (lives in ~/.skill-panel, never commit)
+# Env / secrets / local AI settings (never commit keys)
 .env
 .env.*
+!.env.example
+*.pem
+*.key
 ai.json
-**/ai-last-error.log
 
-# Editor directories and files
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
 .vscode/*
 !.vscode/extensions.json
 .idea
-.DS_Store
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
+
+# Temp / crash leftovers
+*.tmp
+*.temp
+*.bak
+*.pdb
+.skill-panel/

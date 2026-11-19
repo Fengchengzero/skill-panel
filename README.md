@@ -5,18 +5,23 @@
 ## 能力（v0.1）
 
 - 托盘 + 全局快捷键唤出（Win: `Ctrl+Shift+S` / Mac: `Cmd+Shift+S`），窗口置顶
-- 本地技能库卡片：简介、标签、置顶
+- 本地技能库卡片：简介、标签、置顶、封面
 - **应用**：复制部署到 Cursor / Codex 全局 skills，并粘贴 `$文件夹名`
 - ChatGPT：仅复制/粘贴 `$name`（优先 SKILL.md frontmatter `name:`，否则文件夹名；不部署）
 - 安装：本地目录 / Git / skills.sh 风格源
+- 备份与恢复：导出/导入 skills、covers、meta（不含 API Key）
+- AI：批量生成中文简介与封面，并支持封面压缩
 
 ## 数据目录
 
 ```
 ~/.skill-panel/
   skills/     # 中央库
-  meta.json   # 标签、置顶、Agent 路径覆盖
+  covers/     # AI / 手动生成的卡片封面
+  meta.json   # 标签、置顶、封面引用、Agent 路径覆盖
 ```
+
+设置里的「备份与恢复」会一并导出/导入 `skills`、`covers` 与 `meta`（封面可换机还原）。
 
 ## 开发
 
@@ -58,16 +63,12 @@ npm run tauri dev
 
 ### Windows（本机可直接打出安装包）
 
-**给用户安装（推荐）：** 双击 `install-portable.bat`  
-或使用 `release/Skill Panel_0.1.0_x64-setup.exe`（已内置离线 WebView2，约 210MB）。
-
-若弹出「Windows 已保护你的电脑」→ **更多信息** → **仍要运行**（未代码签名时的正常提示）。
-
-重新打包：
-
 ```bat
 build-win.bat
 ```
+
+生成：`src-tauri/target/release/bundle/nsis/*.exe`  
+双击该安装包即可安装（当前用户，一般不需要管理员）。
 
 ### macOS（必须在 Mac 上构建）
 

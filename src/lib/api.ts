@@ -208,11 +208,22 @@ export const api = {
     invoke<GenerateDescriptionResult>("generate_skill_description", { skillId }),
   generateSkillCover: (skillId: string) =>
     invoke<SkillCard[]>("generate_skill_cover", { skillId }),
+  recompressCovers: () =>
+    invoke<[CoverCompressResult, SkillCard[]]>("recompress_covers"),
   exportLibrary: (dest: string, asFolder: boolean) =>
     invoke<{ path: string; message: string }>("export_library", { dest, asFolder }),
   importLibrary: (source: string, mode: "replace" | "merge_skip") =>
     invoke<{ message: string; skills: SkillCard[] }>("import_library", { source, mode }),
 };
+
+export interface CoverCompressResult {
+  scanned: number;
+  compressed: number;
+  skipped: number;
+  bytes_before: number;
+  bytes_after: number;
+  message: string;
+}
 
 export interface AiProgress {
   kind: string;
